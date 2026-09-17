@@ -293,18 +293,29 @@ export class WAMonitoringService {
       ownerJid: instanceData.ownerJid,
     });
 
-    if (
+    const fatalDisconnectCodes = [401, 402, 403, 406];
+    const disconnectCode = Number(instanceData.disconnectionReasonCode || 0);
+    const canAutoReconnect =
       instanceData.connectionStatus === 'open' ||
       instanceData.connectionStatus === 'connecting' ||
-      instanceData.integration === Integration.EVOLUTION
-    ) {
+      instanceData.integration === Integration.EVOLUTION ||
+      (instanceData.connectionStatus === 'close' && !fatalDisconnectCodes.includes(disconnectCode));
+
+    if (canAutoReconnect) {
       this.logger.info(
-        `Auto-connecting instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus})`,
+        `Auto-connecting instance "${instanceData.instanceName}" ` +
+          `(status: ${instanceData.connectionStatus}, reason: ${disconnectCode || 'unknown'})`,
       );
-      await instance.connectToWhatsapp();
+
+      try {
+        await instance.connectToWhatsapp();
+      } catch (error) {
+        this.logger.error(`Auto-connect failed for instance "${instanceData.instanceName}": ${String(error)}`);
+      }
     } else {
       this.logger.info(
-        `Skipping auto-connect for instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus || 'close'})`,
+        `Skipping auto-connect for instance "${instanceData.instanceName}" ` +
+          `(status: ${instanceData.connectionStatus || 'close'}, reason: ${disconnectCode || 'unknown'})`,
       );
     }
 
@@ -333,9 +344,10 @@ export class WAMonitoringService {
             number: instanceData.number,
             businessId: instanceData.businessId,
             connectionStatus: instanceData.connectionStatus as any, // Pass connection status
+            disconnectionReasonCode: instanceData.disconnectionReasonCode,
           };
 
-          this.setInstance(instance);
+          await this.setInstance(instance);
         }),
       );
     }
@@ -354,7 +366,7 @@ export class WAMonitoringService {
 
     await Promise.all(
       instances.map(async (instance) => {
-        this.setInstance({
+        await this.setInstance({
           instanceId: instance.id,
           instanceName: instance.name,
           integration: instance.integration,
@@ -363,6 +375,7 @@ export class WAMonitoringService {
           businessId: instance.businessId,
           ownerJid: instance.ownerJid,
           connectionStatus: instance.connectionStatus as any, // Pass connection status
+          disconnectionReasonCode: instance.disconnectionReasonCode,
         });
       }),
     );
@@ -381,13 +394,14 @@ export class WAMonitoringService {
           where: { id: instanceId },
         });
 
-        this.setInstance({
+        await this.setInstance({
           instanceId: instance.id,
           instanceName: instance.name,
           integration: instance.integration,
           token: instance.token,
           businessId: instance.businessId,
           connectionStatus: instance.connectionStatus as any, // Pass connection status
+          disconnectionReasonCode: instance.disconnectionReasonCode,
         });
       }),
     );

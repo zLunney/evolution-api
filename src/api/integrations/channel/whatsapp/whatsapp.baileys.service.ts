@@ -264,6 +264,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private isDeleting = false; // Flag to prevent reconnection during deletion
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private reconnectTimer?: NodeJS.Timeout;
+  private reconnectInProgress = false;
+  private connectPromise?: Promise<WASocket>;
 
   // Cumulative history sync counters (reset on new sync or completion)
   private historySyncMessageCount = 0;
@@ -287,6 +290,7 @@ export class BaileysStartupService extends ChannelStartupService {
     // Mark instance as deleting to prevent reconnection attempts.
     this.isDeleting = true;
     this.endSession = true;
+    this.clearReconnectState();
 
     this.messageProcessor.onDestroy();
 
@@ -379,6 +383,41 @@ export class BaileysStartupService extends ChannelStartupService {
       base64: this.instance.qrcode?.base64,
       count: this.instance.qrcode?.count,
     };
+  }
+
+  private clearReconnectState() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+
+    this.reconnectInProgress = false;
+  }
+
+  private scheduleReconnect() {
+    if (this.reconnectTimer || this.reconnectInProgress) {
+      this.logger.info(`Reconnect already scheduled or running for instance "${this.instance.name}"`);
+      return;
+    }
+
+    this.logger.info('Reconnecting in 3 seconds...');
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = undefined;
+
+      if (this.isDeleting || this.endSession || this.stateConnection.state === 'open') {
+        return;
+      }
+
+      this.reconnectInProgress = true;
+
+      try {
+        await this.connectToWhatsapp(this.phoneNumber);
+      } catch (error) {
+        this.reconnectInProgress = false;
+        this.logger.error(`Reconnect failed for instance "${this.instance.name}": ${String(error)}`);
+        this.scheduleReconnect();
+      }
+    }, 3000);
   }
 
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
@@ -486,16 +525,17 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      this.reconnectInProgress = false;
+
       // Check if instance is being deleted or session is ending
       if (this.isDeleting || this.endSession) {
+        this.clearReconnectState();
         this.logger.info('Instance is being deleted/ended, skipping reconnection attempt');
         return;
       }
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      // 408 = request timeout — added per #2501 to avoid reconnect loops on
-      // transient network drops where the server returned a 408 in the close.
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 408];
+      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
 
       // FIX: Do not reconnect if it's the initial connection (waiting for QR code)
       // This prevents infinite loop that blocks QR code generation
@@ -516,12 +556,9 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       if (shouldReconnect) {
-        // Add 3 second delay before reconnection to prevent rapid reconnection loops
-        this.logger.info('Reconnecting in 3 seconds...');
-        setTimeout(async () => {
-          await this.connectToWhatsapp(this.phoneNumber);
-        }, 3000);
+        this.scheduleReconnect();
       } else {
+        this.clearReconnectState();
         this.logger.info(`Skipping reconnection for status code ${statusCode} (code is in codesToNotReconnect list)`);
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -558,6 +595,8 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      this.clearReconnectState();
+
       if (!this.client?.user?.id) {
         this.logger.warn('connectionUpdate: connection open but client.user is undefined, skipping');
         return;
@@ -591,6 +630,9 @@ export class BaileysStartupService extends ChannelStartupService {
           profileName: (await this.getProfileName()) as string,
           profilePicUrl: this.instance.profilePictureUrl,
           connectionStatus: 'open',
+          disconnectionAt: null,
+          disconnectionReasonCode: null,
+          disconnectionObject: null,
         },
       });
 
@@ -793,21 +835,32 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
-    this.client = makeWASocket(socketConfig);
+    const previousClient = this.client;
+    const client = makeWASocket(socketConfig);
+    this.client = client;
 
-    if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
-      useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
+    if (previousClient && previousClient !== client) {
+      try {
+        previousClient.ws?.close();
+        previousClient.end(new Error('Socket replaced by a new connection'));
+      } catch {
+        // The previous socket may already be closed after a disconnect.
+      }
     }
 
-    this.eventHandler();
+    if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
+      useVoiceCallsBaileys(this.localSettings.wavoipToken, client, this.connectionStatus.state as any, true);
+    }
 
-    this.client.ws.on('CB:call', (packet) => {
+    this.eventHandler(client);
+
+    client.ws.on('CB:call', (packet) => {
       console.log('CB:call', packet);
       const payload = { event: 'CB:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
     });
 
-    this.client.ws.on('CB:ack,class:call', (packet) => {
+    client.ws.on('CB:ack,class:call', (packet) => {
       console.log('CB:ack,class:call', packet);
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
@@ -815,35 +868,46 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.phoneNumber = number;
 
-    return this.client;
+    return client;
   }
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    if (this.connectPromise) {
+      this.logger.info(`Connection attempt already running for instance "${this.instance.name}"`);
+      return this.connectPromise;
+    }
+
+    const connectPromise = this.startConnection(number);
+    this.connectPromise = connectPromise;
+
     try {
-      this.loadChatwoot();
-      this.loadSettings();
-      this.loadWebhook();
-      this.loadProxy();
-
-      // Remontar o messageProcessor para garantir que está funcionando após reconexão
-      this.messageProcessor.mount({
-        onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
-      });
-
-      return await this.createClient(number);
+      return await connectPromise;
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
+    } finally {
+      if (this.connectPromise === connectPromise) {
+        this.connectPromise = undefined;
+      }
     }
   }
 
+  private async startConnection(number?: string): Promise<WASocket> {
+    this.loadChatwoot();
+    this.loadSettings();
+    this.loadWebhook();
+    this.loadProxy();
+
+    // Remontar o messageProcessor para garantir que está funcionando após reconexão
+    this.messageProcessor.mount({
+      onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
+    });
+
+    return this.createClient(number);
+  }
+
   public async reloadConnection(): Promise<WASocket> {
-    try {
-      return await this.createClient(this.phoneNumber);
-    } catch (error) {
-      this.logger.error(error);
-      throw new InternalServerErrorException(error?.toString());
-    }
+    return this.connectToWhatsapp(this.phoneNumber);
   }
 
   private readonly chatHandle = {
@@ -2088,13 +2152,23 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
-  private eventHandler() {
-    this.client.ev.process(async (events) => {
+  private eventHandler(client: WASocket) {
+    client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
+          if (client !== this.client) {
+            this.logger.info(`Ignoring events from a stale socket for instance "${this.instance.name}"`);
+            return;
+          }
+
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
             const settings = await this.findSettings();
+
+            if (client !== this.client) {
+              this.logger.info(`Ignoring events from a replaced socket for instance "${this.instance.name}"`);
+              return;
+            }
 
             if (events.call) {
               const call = events.call[0];
@@ -2116,11 +2190,11 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
+              await this.connectionUpdate(events['connection.update']);
             }
 
             if (events['creds.update']) {
-              this.instance.authState.saveCreds();
+              await this.instance.authState.saveCreds();
             }
 
             if (events['messaging-history.set']) {
@@ -4520,7 +4594,7 @@ export class BaileysStartupService extends ChannelStartupService {
       await this.client.updateLastSeenPrivacy(settings.last);
       await this.client.updateGroupsAddPrivacy(settings.groupadd);
 
-      this.reloadConnection();
+      await this.reloadConnection();
 
       return {
         update: 'success',
@@ -4609,7 +4683,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       await this.client.updateProfilePicture(this.instance.wuid, pic);
 
-      this.reloadConnection();
+      await this.reloadConnection();
 
       return { update: 'success' };
     } catch (error) {
@@ -4621,7 +4695,7 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       await this.client.removeProfilePicture(this.instance.wuid);
 
-      this.reloadConnection();
+      await this.reloadConnection();
 
       return { update: 'success' };
     } catch (error) {

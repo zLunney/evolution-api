@@ -13,6 +13,7 @@ export class InstanceDto extends IntegrationDto {
   status?: string;
   ownerJid?: string;
   connectionStatus?: string;
+  disconnectionReasonCode?: number;
   profileName?: string;
   profilePicUrl?: string;
   // settings
